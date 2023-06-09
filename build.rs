@@ -2,12 +2,6 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // Running tests concurrently makes `tests::device_query_infos` fail sometimes
-    // Reducing the tests thread count to one fixes the issue
-    println!("cargo:rustc-env=RUST_TEST_THREADS=1");
-
-    // Generating bindings
-
     println!("cargo:rerun-if-changed=v4l2loopback.h");
 
     let bindings = bindgen::Builder::default()
