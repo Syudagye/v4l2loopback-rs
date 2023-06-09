@@ -33,7 +33,6 @@
 //!     max_height: 4000,
 //!     max_buffers: 9,
 //!     max_openers: 3,
-//!     announce_all_caps: 1,
 //! };
 //! // Create a device
 //! let device_num =
@@ -54,12 +53,11 @@
 //! [v4l2loopback-dkms-git]: https://aur.archlinux.org/packages/v4l2loopback-dkms-git
 
 use std::{
-    ffi::{CStr, CString, NulError},
+    ffi::{CStr, CString},
     fs::OpenOptions,
     io::ErrorKind,
     os::fd::{IntoRawFd, RawFd},
     slice::from_raw_parts,
-    str::Utf8Error,
 };
 
 use nix::{errno::Errno, ioctl_read_bad, ioctl_readwrite_bad, ioctl_write_int_bad};
@@ -117,18 +115,16 @@ pub struct DeviceConfig {
     pub max_height: u32,
 
     /// Number of buffers to allocate for the queue.
-    /// If <=0, then a default value is picked by v4l2loopback.
-    pub max_buffers: i32,
+    /// If 0, then a default value is picked by v4l2loopback.
+    pub max_buffers: u32,
 
     /// How many consumers are allowed to open this device concurrently.
-    /// If <=0, then a default value is picked by v4l2loopback.
-    pub max_openers: i32,
-
-    pub announce_all_caps: i32,
+    /// If 0, then a default value is picked by v4l2loopback.
+    pub max_openers: u32,
 }
 
 impl TryInto<ffi::v4l2_loopback_config> for DeviceConfig {
-    type Error = NulError;
+    type Error = Box<dyn std::error::Error>;
 
     fn try_into(self) -> Result<ffi::v4l2_loopback_config, Self::Error> {
         let mut cfg = ffi::v4l2_loopback_config::default();
@@ -144,16 +140,15 @@ impl TryInto<ffi::v4l2_loopback_config> for DeviceConfig {
         cfg.max_width = self.max_width;
         cfg.min_height = self.min_height;
         cfg.max_height = self.max_height;
-        cfg.max_buffers = self.max_buffers;
-        cfg.max_openers = self.max_openers;
-        cfg.announce_all_caps = self.announce_all_caps;
+        cfg.max_buffers = self.max_buffers.try_into()?;
+        cfg.max_openers = self.max_openers.try_into()?;
 
         Ok(cfg)
     }
 }
 
 impl TryFrom<ffi::v4l2_loopback_config> for DeviceConfig {
-    type Error = Utf8Error;
+    type Error = Box<dyn std::error::Error>;
 
     fn try_from(value: ffi::v4l2_loopback_config) -> Result<Self, Self::Error> {
         let ffi::v4l2_loopback_config {
@@ -167,7 +162,7 @@ impl TryFrom<ffi::v4l2_loopback_config> for DeviceConfig {
             max_buffers,
             max_openers,
             debug: _,
-            announce_all_caps,
+            announce_all_caps: _,
         } = value;
 
         let label = unsafe { CStr::from_ptr(card_label.as_ptr()) }
@@ -180,9 +175,8 @@ impl TryFrom<ffi::v4l2_loopback_config> for DeviceConfig {
             max_width,
             min_height,
             max_height,
-            max_buffers,
-            max_openers,
-            announce_all_caps,
+            max_buffers: max_buffers.try_into()?,
+            max_openers: max_openers.try_into()?,
         })
     }
 }
@@ -238,14 +232,15 @@ pub enum Error {
     #[error("Device /dev/video{0} not found")]
     DeviceNotFound(u32),
 
-    /// Unable to properly convert the label name.
+    /// Unable to properly convert the config.
     ///
-    /// The label need to comply to the C string format, which means it must not contain null
-    /// bytes in it. It also need to contain at most 32 characters.
-    /// This error can also be returned if the internal label of a device is wrongly formatted, in
-    /// this case, this issue should be forwarded to the v4l2loopback project.
-    #[error("Failed to convert label name. The label string must not contain null bytes, and it's legth must not exceed 32.")]
-    LabelConversionError(Box<dyn std::error::Error>),
+    /// Something went wrong when converting a [`DeviceConfig`] from/to the v4l2loopback device
+    /// config format.
+    /// This can be caused by the following:
+    /// - The label containing null bytes
+    /// - a too high value for `max_buffers` and `max_openers` (above [`i32::MAX`])
+    #[error("Failed to convert device configuration: {0}")]
+    ConfigConversionError(Box<dyn std::error::Error>),
 
     /// Any other error
     #[error(transparent)]
@@ -263,13 +258,13 @@ pub enum Error {
 /// # Errors
 ///
 /// This function will return the following errors:
-/// - [`LabelConversionError`] if the label given in `config` contains null bytes.
+/// - [`ConfigConversionError`] if the label given in `config` contains null bytes.
 /// - [`ControlDevice`] if it is unable to open the control device
 /// - [`Ioctl`] if the underlying ioctl call fails
 /// - [`DeviceCreationFailed`] if v4l2loopback was unable to create a device. This generally
 /// happens when you specify an explicit number in `num`.
 ///
-/// [`LabelConversionError`]: Error::LabelConversionError
+/// [`ConfigConversionError`]: Error::ConfigConversionError
 /// [`ControlDevice`]: Error::ControlDevice
 /// [`Ioctl`]: Error::Ioctl
 /// [`DeviceCreationFailed`]: Error::DeviceCreationFailed
@@ -291,7 +286,7 @@ pub enum Error {
 pub fn add_device(num: Option<u32>, config: DeviceConfig) -> Result<u32, Error> {
     let mut cfg: ffi::v4l2_loopback_config = match config.try_into() {
         Ok(cfg) => cfg,
-        Err(e) => return Err(Error::LabelConversionError(Box::new(e))),
+        Err(e) => return Err(Error::ConfigConversionError(e)),
     };
     cfg.output_nr = num.map(i32::try_from).and_then(Result::ok).unwrap_or(-1);
 
@@ -377,13 +372,13 @@ pub fn delete_device(device_num: u32) -> Result<(), Error> {
 /// - [`ControlDevice`] if it is unable to open the control device
 /// - [`Ioctl`] if the underlying ioctl call fails
 /// - [`DeviceNotFound`] if the specified device is not recognized by v4l2loopback.
-/// - [`LabelConversionError`] if the label returned by v4l2loopback contains null bytes.
+/// - [`ConfigConversionError`] if the label returned by v4l2loopback contains null bytes.
 /// - [`Other`] for other errors
 ///
 /// [`ControlDevice`]: Error::ControlDevice
 /// [`Ioctl`]: Error::Ioctl
 /// [`DeviceNotFound`]: Error::DeviceNotFound
-/// [`LabelConversionError`]: Error::LabelConversionError
+/// [`ConfigConversionError`]: Error::ConfigConversionError
 /// [`Other`]: Error::Other
 ///
 /// # Example
@@ -401,7 +396,6 @@ pub fn delete_device(device_num: u32) -> Result<(), Error> {
 ///     max_height: 4000,
 ///     max_buffers: 9,
 ///     max_openers: 3,
-///     announce_all_caps: 1,
 /// };
 /// // Device creation
 /// let device_num =
@@ -442,7 +436,7 @@ pub fn query_device(device_num: u32) -> Result<DeviceConfig, Error> {
 
     let device_config = match DeviceConfig::try_from(cfg) {
         Ok(cfg) => cfg,
-        Err(e) => return Err(Error::LabelConversionError(Box::new(e))),
+        Err(e) => return Err(Error::ConfigConversionError(e)),
     };
 
     Ok(device_config)

@@ -35,7 +35,6 @@ let device_config = DeviceConfig {
     max_height: 4000,
     max_buffers: 9,
     max_openers: 3,
-    announce_all_caps: 1,
 };
 // Create a device
 let device_num =
