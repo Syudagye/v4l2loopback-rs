@@ -20,7 +20,7 @@
 //!
 //! ```
 //! use std::path::Path;
-//! use v4l2loopback_rs::{add_device, delete_device, query_device, DeviceConfig};
+//! use v4l2loopback::{add_device, delete_device, query_device, DeviceConfig};
 //!
 //! // Device configuration
 //! // Here you declare informations about the camera device that will be created.
@@ -278,7 +278,7 @@ pub enum Error {
 ///
 /// ```
 /// use std::path::Path;
-/// use v4l2loopback_rs::{add_device, delete_device, DeviceConfig};
+/// use v4l2loopback::{add_device, delete_device, DeviceConfig};
 ///
 /// // We create the device without specifying a number
 /// let device_num = add_device(None, DeviceConfig::default()).expect("Error when creating the device");
@@ -333,7 +333,7 @@ pub fn add_device(num: Option<u32>, config: DeviceConfig) -> Result<u32, Error> 
 ///
 /// ```
 /// use std::path::Path;
-/// use v4l2loopback_rs::{add_device, delete_device, DeviceConfig};
+/// use v4l2loopback::{add_device, delete_device, DeviceConfig};
 ///
 /// // You created a device earlier...
 /// let device_num = add_device(None, DeviceConfig::default()).expect("Error when creating the device");
@@ -390,7 +390,7 @@ pub fn delete_device(device_num: u32) -> Result<(), Error> {
 ///
 /// ```
 /// use std::path::Path;
-/// use v4l2loopback_rs::{add_device, delete_device, query_device, DeviceConfig};
+/// use v4l2loopback::{add_device, delete_device, query_device, DeviceConfig};
 ///
 /// // We specify our desired config
 /// let device_config = DeviceConfig {
