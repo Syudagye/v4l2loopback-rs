@@ -96,18 +96,6 @@ pub use ffi::V4L2LOOPBACK_VERSION_BUGFIX;
 pub use ffi::V4L2LOOPBACK_VERSION_MAJOR;
 pub use ffi::V4L2LOOPBACK_VERSION_MINOR;
 
-ioctl_readwrite_bad!(
-    v4l2loopback_ctl_add,
-    ffi::V4L2LOOPBACK_CTL_ADD,
-    ffi::v4l2_loopback_config
-);
-ioctl_write_int_bad!(v4l2loopback_ctl_remove, ffi::V4L2LOOPBACK_CTL_REMOVE);
-ioctl_read_bad!(
-    v4l2loopback_ctl_query,
-    ffi::V4L2LOOPBACK_CTL_QUERY,
-    ffi::v4l2_loopback_config
-);
-
 /// Wrapper type describing a v4l2loopback device.
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct DeviceConfig {
@@ -147,7 +135,7 @@ impl TryInto<ffi::v4l2_loopback_config> for DeviceConfig {
 
         let mut slice: [i8; 32] = [0; 32];
         unsafe { from_raw_parts(CString::new(self.label)?.as_ptr(), 32) }
-            .into_iter()
+            .iter()
             .enumerate()
             .for_each(|(i, v)| slice[i] = *v);
         cfg.card_label = slice;
@@ -219,10 +207,8 @@ pub enum ControlDeviceError {
     Other(Box<dyn std::error::Error>),
 }
 
-const CONTROL_DEVICE: &'static str = "/dev/v4l2loopback";
-
 fn open_control_device() -> Result<RawFd, ControlDeviceError> {
-    match OpenOptions::new().read(true).open(CONTROL_DEVICE) {
+    match OpenOptions::new().read(true).open("/dev/v4l2loopback") {
         Ok(f) => Ok(f.into_raw_fd()),
         Err(e) => match e.kind() {
             ErrorKind::NotFound => Err(ControlDeviceError::NotFound),
@@ -307,13 +293,15 @@ pub fn add_device(num: Option<u32>, config: DeviceConfig) -> Result<u32, Error> 
         Ok(cfg) => cfg,
         Err(e) => return Err(Error::LabelConversionError(Box::new(e))),
     };
-    cfg.output_nr = num
-        .map(i32::try_from)
-        .map(Result::ok)
-        .flatten()
-        .unwrap_or(-1);
+    cfg.output_nr = num.map(i32::try_from).and_then(Result::ok).unwrap_or(-1);
 
     let fd = open_control_device()?;
+
+    ioctl_readwrite_bad!(
+        v4l2loopback_ctl_add,
+        ffi::V4L2LOOPBACK_CTL_ADD,
+        ffi::v4l2_loopback_config
+    );
 
     let dev = unsafe { v4l2loopback_ctl_add(fd, &mut cfg as *mut ffi::v4l2_loopback_config) }?;
 
@@ -364,6 +352,8 @@ pub fn delete_device(device_num: u32) -> Result<(), Error> {
         Ok(n) => n,
         Err(e) => return Err(Error::Other(Box::new(e))),
     };
+
+    ioctl_write_int_bad!(v4l2loopback_ctl_remove, ffi::V4L2LOOPBACK_CTL_REMOVE);
 
     let res = unsafe { v4l2loopback_ctl_remove(fd, converted_num) }?;
 
@@ -428,13 +418,21 @@ pub fn delete_device(device_num: u32) -> Result<(), Error> {
 /// assert!(!Path::new(&format!("/dev/video{}", device_num)).exists());
 /// ```
 pub fn query_device(device_num: u32) -> Result<DeviceConfig, Error> {
-    let mut cfg = ffi::v4l2_loopback_config::default();
-    cfg.output_nr = match device_num.try_into() {
-        Ok(n) => n,
-        Err(e) => return Err(Error::Other(Box::new(e))),
+    let mut cfg = ffi::v4l2_loopback_config {
+        output_nr: match device_num.try_into() {
+            Ok(n) => n,
+            Err(e) => return Err(Error::Other(Box::new(e))),
+        },
+        ..Default::default()
     };
 
     let fd = open_control_device()?;
+
+    ioctl_read_bad!(
+        v4l2loopback_ctl_query,
+        ffi::V4L2LOOPBACK_CTL_QUERY,
+        ffi::v4l2_loopback_config
+    );
 
     let res = unsafe { v4l2loopback_ctl_query(fd, &mut cfg as *mut ffi::v4l2_loopback_config) }?;
 
