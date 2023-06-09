@@ -10,3 +10,4 @@ bindgen = "0.65.1"
 
 [dependencies]
 nix = { version = "0.26.2", default-features = false, features = ["ioctl"] }
+thiserror = "1.0.40"

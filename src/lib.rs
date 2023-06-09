@@ -1,11 +1,13 @@
 use std::{
-    ffi::{CStr, CString},
+    ffi::{CStr, CString, NulError},
     fs::OpenOptions,
+    io::ErrorKind,
     os::fd::{IntoRawFd, RawFd},
     slice::from_raw_parts,
+    str::Utf8Error,
 };
 
-use nix::{ioctl_read_bad, ioctl_readwrite_bad, ioctl_write_int_bad};
+use nix::{errno::Errno, ioctl_read_bad, ioctl_readwrite_bad, ioctl_write_int_bad};
 
 mod ffi {
     #![allow(non_upper_case_globals)]
@@ -37,6 +39,7 @@ mod ffi {
 pub use ffi::V4L2LOOPBACK_VERSION_BUGFIX;
 pub use ffi::V4L2LOOPBACK_VERSION_MAJOR;
 pub use ffi::V4L2LOOPBACK_VERSION_MINOR;
+use thiserror::Error;
 
 ioctl_readwrite_bad!(
     v4l2loopback_ctl_add,
@@ -49,15 +52,6 @@ ioctl_read_bad!(
     ffi::V4L2LOOPBACK_CTL_QUERY,
     ffi::v4l2_loopback_config
 );
-
-const CONTROL_DEVICE: &'static str = "/dev/v4l2loopback";
-
-fn open_control_device() -> Result<RawFd, Box<dyn std::error::Error>> {
-    Ok(OpenOptions::new()
-        .read(true)
-        .open(CONTROL_DEVICE)?
-        .into_raw_fd())
-}
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct DeviceConfig {
@@ -72,7 +66,7 @@ pub struct DeviceConfig {
 }
 
 impl TryInto<ffi::v4l2_loopback_config> for DeviceConfig {
-    type Error = Box<dyn std::error::Error>;
+    type Error = NulError;
 
     fn try_into(self) -> Result<ffi::v4l2_loopback_config, Self::Error> {
         let mut cfg = ffi::v4l2_loopback_config::default();
@@ -97,7 +91,7 @@ impl TryInto<ffi::v4l2_loopback_config> for DeviceConfig {
 }
 
 impl TryFrom<ffi::v4l2_loopback_config> for DeviceConfig {
-    type Error = Box<dyn std::error::Error>;
+    type Error = Utf8Error;
 
     fn try_from(value: ffi::v4l2_loopback_config) -> Result<Self, Self::Error> {
         let ffi::v4l2_loopback_config {
@@ -131,11 +125,57 @@ impl TryFrom<ffi::v4l2_loopback_config> for DeviceConfig {
     }
 }
 
-pub fn create_device(
-    num: Option<u32>,
-    config: DeviceConfig,
-) -> Result<u32, Box<dyn std::error::Error>> {
-    let mut cfg: ffi::v4l2_loopback_config = config.try_into()?;
+#[derive(Debug, Error)]
+pub enum ContolDeviceError {
+    #[error("You don't have the right permissions")]
+    PermissionDenied,
+
+    #[error("Can't find control device /dev/v4l2loopback, check if the kernel module is properly loaded")]
+    NotFound,
+
+    #[error("Error when opening the control device")]
+    Other(Box<dyn std::error::Error>),
+}
+
+const CONTROL_DEVICE: &'static str = "/dev/v4l2loopback";
+
+fn open_control_device() -> Result<RawFd, ContolDeviceError> {
+    match OpenOptions::new().read(true).open(CONTROL_DEVICE) {
+        Ok(f) => Ok(f.into_raw_fd()),
+        Err(e) => match e.kind() {
+            ErrorKind::NotFound => Err(ContolDeviceError::NotFound),
+            ErrorKind::PermissionDenied => Err(ContolDeviceError::PermissionDenied),
+            _ => Err(ContolDeviceError::Other(Box::new(e))),
+        },
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("Couldn't open control device: {0}")]
+    ControlDevice(#[from] ContolDeviceError),
+
+    #[error("Error returned from ioctl: {0}")]
+    Ioctl(#[from] Errno),
+
+    #[error("Failed to create device")]
+    DeviceCreationFailed,
+
+    #[error("Device /dev/video{0} not found")]
+    DeviceNotFound(u32),
+
+    #[error("Failed to convert label name. The label string must not contain null bytes, and it's legth must not exceed 32.")]
+    LabelConversionError(Box<dyn std::error::Error>),
+
+    #[error(transparent)]
+    Other(Box<dyn std::error::Error>),
+}
+
+pub fn add_device(num: Option<u32>, config: DeviceConfig) -> Result<u32, Error> {
+    let mut cfg: ffi::v4l2_loopback_config = match config.try_into() {
+        Ok(cfg) => cfg,
+        Err(e) => return Err(Error::LabelConversionError(Box::new(e))),
+    };
     cfg.output_nr = num
         .map(i32::try_from)
         .map(Result::ok)
@@ -146,28 +186,49 @@ pub fn create_device(
 
     let dev = unsafe { v4l2loopback_ctl_add(fd, &mut cfg as *mut ffi::v4l2_loopback_config) }?;
 
-    if cfg.output_nr.is_negative() {
-        // TODO: Error handling
+    if dev.is_negative() {
+        return Err(Error::DeviceCreationFailed);
     }
+
     Ok(dev as u32)
 }
 
-pub fn delete_device(device_num: u32) -> Result<(), Box<dyn std::error::Error>> {
+pub fn delete_device(device_num: u32) -> Result<(), Error> {
     let fd = open_control_device()?;
-    println!("Removing {}", device_num);
-    unsafe { v4l2loopback_ctl_remove(fd, device_num.try_into()?) }?;
+
+    let converted_num = match device_num.try_into() {
+        Ok(n) => n,
+        Err(e) => return Err(Error::Other(Box::new(e))),
+    };
+
+    let res = unsafe { v4l2loopback_ctl_remove(fd, converted_num) }?;
+
+    if res.is_negative() {
+        return Err(Error::DeviceNotFound(device_num));
+    }
+
     Ok(())
 }
 
-pub fn query_device(device_num: u32) -> Result<DeviceConfig, Box<dyn std::error::Error>> {
+pub fn query_device(device_num: u32) -> Result<DeviceConfig, Error> {
     let mut cfg = ffi::v4l2_loopback_config::default();
-    cfg.output_nr = device_num.try_into()?;
+    cfg.output_nr = match device_num.try_into() {
+        Ok(n) => n,
+        Err(e) => return Err(Error::Other(Box::new(e))),
+    };
 
     let fd = open_control_device()?;
 
-    unsafe { v4l2loopback_ctl_query(fd, &mut cfg as *mut ffi::v4l2_loopback_config) }?;
+    let res = unsafe { v4l2loopback_ctl_query(fd, &mut cfg as *mut ffi::v4l2_loopback_config) }?;
 
-    let device_config = DeviceConfig::try_from(cfg)?;
+    if res.is_negative() {
+        return Err(Error::DeviceNotFound(device_num));
+    }
+
+    let device_config = match DeviceConfig::try_from(cfg) {
+        Ok(cfg) => cfg,
+        Err(e) => return Err(Error::LabelConversionError(Box::new(e))),
+    };
 
     Ok(device_config)
 }
@@ -176,13 +237,13 @@ pub fn query_device(device_num: u32) -> Result<DeviceConfig, Box<dyn std::error:
 mod tests {
     use std::path::Path;
 
-    use crate::{create_device, delete_device, query_device, DeviceConfig};
+    use crate::{add_device, delete_device, query_device, DeviceConfig};
 
     #[test]
     fn device_no_num() {
         // Device creation
         let device_num =
-            create_device(None, Default::default()).expect("Error when creating the device");
+            add_device(None, Default::default()).expect("Error when creating the device");
         assert!(Path::new(&format!("/dev/video{}", device_num)).exists());
 
         // Device removal
@@ -199,8 +260,8 @@ mod tests {
         }
 
         // Device creation
-        let device_num = create_device(Some(next_num), Default::default())
-            .expect("Error when creating the device");
+        let device_num =
+            add_device(Some(next_num), Default::default()).expect("Error when creating the device");
         assert!(Path::new(&format!("/dev/video{}", device_num)).exists());
 
         // Device removal
@@ -224,7 +285,7 @@ mod tests {
             announce_all_caps: 1,
         };
         let device_num =
-            create_device(None, device_config.clone()).expect("Error when creating the device");
+            add_device(None, device_config.clone()).expect("Error when creating the device");
         assert!(Path::new(&format!("/dev/video{}", device_num)).exists());
 
         // Check informations
